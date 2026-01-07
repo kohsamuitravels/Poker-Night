@@ -9,7 +9,7 @@ export async function POST(req: Request) {
   try {
     const supabase = createClient();
 
-    // auth
+    // 1) Auth
     const {
       data: { user },
       error: userError,
@@ -19,7 +19,7 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    // role
+    // 2) Role
     const { data: profile, error: profileErr } = await supabase
       .from("profiles")
       .select("role")
@@ -37,7 +37,7 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Forbidden" }, { status: 403 });
     }
 
-    // body
+    // 3) Body
     const body = await req.json().catch(() => null);
     const tableId: string | undefined = body?.tableId;
 
@@ -45,22 +45,43 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Missing tableId" }, { status: 400 });
     }
 
-    // get running session
-    const { data: session, error: sessionErr } = await supabase
+    // 4) Get running session SAFELY (no .single())
+    const { data: runningSessions, error: sessionErr } = await supabase
       .from("table_sessions")
-      .select("id, dealer_user_id, status")
+      .select("id, dealer_user_id, status, started_at")
       .eq("table_id", tableId)
       .eq("status", "running")
-      .single();
+      .order("started_at", { ascending: false });
 
-    if (sessionErr || !session) {
+    if (sessionErr) {
+      return NextResponse.json(
+        { error: "Session read failed", details: sessionErr.message },
+        { status: 500 }
+      );
+    }
+
+    if (!runningSessions || runningSessions.length === 0) {
       return NextResponse.json(
         { error: "No running session for this table" },
         { status: 400 }
       );
     }
 
-    // members joined
+    // אם יש כמה running - אל תמשיכי כאילו הכל בסדר
+    if (runningSessions.length > 1) {
+      return NextResponse.json(
+        {
+          error: "Multiple running sessions found (DB is inconsistent)",
+          running_count: runningSessions.length,
+          latest_session_id: runningSessions[0].id,
+        },
+        { status: 409 }
+      );
+    }
+
+    const session = runningSessions[0];
+
+    // 5) Members joined
     const { data: members, error: membersErr } = await supabase
       .from("table_members")
       .select("user_id, seat, joined_at")
@@ -81,14 +102,19 @@ export async function POST(req: Request) {
       );
     }
 
-    // order: seat if available, else joined_at
-    const withSeat = members.filter((m) => m.seat !== null && m.seat !== undefined);
-    const useSeats = withSeat.length >= 4;
+    // 6) Order: seat if possible else joined_at
+    const seatedCount = members.filter((m) => m.seat !== null && m.seat !== undefined).length;
+    const useSeats = seatedCount >= 4;
 
     const ordered = [...members].sort((a, b) => {
-      if (useSeats) return (a.seat ?? 999999) - (b.seat ?? 999999);
-      const aTime = a.joined_at ? new Date(a.joined_at).getTime() : Number.MAX_SAFE_INTEGER;
-      const bTime = b.joined_at ? new Date(b.joined_at).getTime() : Number.MAX_SAFE_INTEGER;
+      if (useSeats) {
+        const aSeat = (a.seat ?? 999999) as number;
+        const bSeat = (b.seat ?? 999999) as number;
+        return aSeat - bSeat;
+      }
+
+      const aTime = a.joined_at ? new Date(a.joined_at as any).getTime() : Number.MAX_SAFE_INTEGER;
+      const bTime = b.joined_at ? new Date(b.joined_at as any).getTime() : Number.MAX_SAFE_INTEGER;
       return aTime - bTime;
     });
 
@@ -100,10 +126,11 @@ export async function POST(req: Request) {
       );
     }
 
-    // determine next hand number
+    // 7) Prevent double-start (if you have an "active" hand concept)
+    // Example: don't allow another hand if last one isn't finished
     const { data: lastHand, error: lastHandErr } = await supabase
       .from("hands")
-      .select("hand_number, dealer_user_id")
+      .select("id, hand_number, dealer_user_id, status")
       .eq("session_id", session.id)
       .order("hand_number", { ascending: false })
       .limit(1)
@@ -116,29 +143,47 @@ export async function POST(req: Request) {
       );
     }
 
-    const handNumber = (lastHand?.hand_number ?? 0) + 1;
+    // אם יש לך סטטוסים של hand שמייצגים "עדיין רצה" - תשימי פה guard
+    // שימי לב: זה תלוי אצלך איך הגדרת status
+    if (lastHand && lastHand.status && lastHand.status !== "finished") {
+      // אם אצלך "waiting_deal" נחשב רץ, זה ימנע start כפול
+      return NextResponse.json(
+        { error: "Previous hand not finished", hand_id: lastHand.id, status: lastHand.status },
+        { status: 409 }
+      );
+    }
 
-    // dealer rotation:
-    // hand #1 uses session.dealer_user_id
-    // next hands: dealer = next player after previous dealer (clockwise)
+    const nextHandNumber = (lastHand?.hand_number ?? 0) + 1;
+
+    // 8) Dealer rotation
+    // Hand #1: session.dealer_user_id
+    // Next: dealer = next player after prev dealer (lastHand.dealer_user_id)
     const prevDealerId = lastHand?.dealer_user_id ?? session.dealer_user_id;
 
-    const prevDealerIndex = players.indexOf(prevDealerId);
-    const dealerIndex =
-      prevDealerIndex === -1 ? 0 : nextIndex(prevDealerIndex, players.length);
+    let dealerIndex = players.indexOf(prevDealerId);
+    if (dealerIndex === -1) {
+      // prev dealer left table -> fallback to first in order
+      dealerIndex = 0;
+    } else {
+      dealerIndex = nextIndex(dealerIndex, players.length);
+    }
 
     const dealer_user_id = players[dealerIndex];
     const sb_user_id = players[nextIndex(dealerIndex, players.length)];
     const bb_user_id = players[nextIndex(nextIndex(dealerIndex, players.length), players.length)];
-    const turn_user_id = players[nextIndex(nextIndex(nextIndex(dealerIndex, players.length), players.length), players.length)]; // UTG (preflop)
 
-    // create hand
+    // UTG preflop (for 4+ players): player after BB
+    const turn_user_id = players[
+      nextIndex(nextIndex(nextIndex(dealerIndex, players.length), players.length), players.length)
+    ];
+
+    // 9) Create hand
     const { data: hand, error: handErr } = await supabase
       .from("hands")
       .insert({
         table_id: tableId,
         session_id: session.id,
-        hand_number: handNumber,
+        hand_number: nextHandNumber,
         status: "waiting_deal",
         round: "preflop",
         dealer_user_id,
@@ -163,13 +208,11 @@ export async function POST(req: Request) {
         hand,
         order_used: useSeats ? "seat" : "joined_at",
         players_order: players,
+        prev_dealer_id: prevDealerId,
       },
       { status: 200 }
     );
   } catch (err: any) {
-    return NextResponse.json(
-      { error: err?.message ?? "Unknown error" },
-      { status: 500 }
-    );
+    return NextResponse.json({ error: err?.message ?? "Unknown error" }, { status: 500 });
   }
 }
