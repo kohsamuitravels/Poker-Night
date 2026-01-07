@@ -5,7 +5,7 @@ export async function POST(req: Request) {
   try {
     const supabase = createClient();
 
-    // 1) Auth
+    // Auth
     const {
       data: { user },
       error: userError,
@@ -15,76 +15,89 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    // 2) Role check
-    const { data: profile, error: profileError } = await supabase
-      .from("profiles")
-      .select("role")
-      .eq("id", user.id)
-      .single();
-
-    if (profileError) {
-      return NextResponse.json(
-        { error: "Profile read failed", details: profileError.message },
-        { status: 500 }
-      );
-    }
-
-    if (profile?.role !== "super_admin") {
-      return NextResponse.json({ error: "Forbidden" }, { status: 403 });
-    }
-
-    // 3) Body
+    // Body
     const body = await req.json().catch(() => null);
-    const tableId = body?.tableId;
-    const userId = body?.userId;
+    const inviteId = body?.inviteId;
+    const action = body?.action; // "accept" | "decline"
 
-    if (!tableId || !userId) {
+    if (!inviteId || !["accept", "decline"].includes(action)) {
       return NextResponse.json(
-        { error: "Missing tableId or userId" },
+        { error: "Missing inviteId or invalid action" },
         { status: 400 }
       );
     }
 
-    // 4) ליצור invite (אם כבר קיים pending - נחזיר אותו)
-    // קודם נבדוק אם יש כבר invite פעיל
-    const { data: existing } = await supabase
+    // Fetch invite + ownership
+    const { data: invite, error: inviteErr } = await supabase
       .from("table_invites")
-      .select("id,status")
-      .eq("table_id", tableId)
-      .eq("user_id", userId)
-      .in("status", ["pending", "accepted"])
-      .maybeSingle();
+      .select("id, table_id, user_id, status")
+      .eq("id", inviteId)
+      .single();
 
-    if (existing?.status === "pending") {
-      return NextResponse.json({ inviteId: existing.id, reused: true }, { status: 200 });
+    if (inviteErr || !invite) {
+      return NextResponse.json({ error: "Invite not found" }, { status: 404 });
     }
-    if (existing?.status === "accepted") {
+
+    if (invite.user_id !== user.id) {
+      return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+    }
+
+    if (invite.status !== "pending") {
       return NextResponse.json(
-        { error: "User already accepted invite for this table" },
+        { error: "Invite is not pending", status: invite.status },
         { status: 409 }
       );
     }
 
-    // 5) Insert invite
-    const { data: invite, error: insertError } = await supabase
-      .from("table_invites")
-      .insert({
-        table_id: tableId,
-        user_id: userId,
-        invited_by: user.id,
-        status: "pending",
-      })
-      .select("id, table_id, user_id, status, created_at")
-      .single();
+    // Decline
+    if (action === "decline") {
+      const { error: updErr } = await supabase
+        .from("table_invites")
+        .update({ status: "declined" })
+        .eq("id", inviteId);
 
-    if (insertError) {
+      if (updErr) {
+        return NextResponse.json(
+          { error: "Update failed", details: updErr.message },
+          { status: 500 }
+        );
+      }
+
+      return NextResponse.json({ ok: true, action: "decline" }, { status: 200 });
+    }
+
+    // Accept: update invite
+    const { error: accErr } = await supabase
+      .from("table_invites")
+      .update({ status: "accepted" })
+      .eq("id", inviteId);
+
+    if (accErr) {
       return NextResponse.json(
-        { error: "Insert failed", details: insertError.message },
+        { error: "Invite update failed", details: accErr.message },
         { status: 500 }
       );
     }
 
-    return NextResponse.json({ invite }, { status: 200 });
+    // Accept: upsert member joined
+    const { error: memberErr } = await supabase.from("table_members").upsert(
+      {
+        table_id: invite.table_id,
+        user_id: user.id,
+        status: "joined",
+        joined_at: new Date().toISOString(),
+      },
+      { onConflict: "table_id,user_id" }
+    );
+
+    if (memberErr) {
+      return NextResponse.json(
+        { error: "Member upsert failed", details: memberErr.message },
+        { status: 500 }
+      );
+    }
+
+    return NextResponse.json({ ok: true, action: "accept" }, { status: 200 });
   } catch (err: any) {
     return NextResponse.json(
       { error: err?.message ?? "Unknown error" },
