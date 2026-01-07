@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect } from 'react'
+import { useEffect, useRef } from 'react'
 import { createClient } from '@/lib/supabase/client'
 import { useRouter } from 'next/navigation'
 import { toast } from 'sonner'
@@ -12,12 +12,12 @@ type ApprovalWatcherProps = {
 
 export function ApprovalWatcher({ userId, currentRole }: ApprovalWatcherProps) {
   const router = useRouter()
-  const supabase = createClient()
+  const redirectedRef = useRef(false)
 
   useEffect(() => {
-    if (currentRole !== 'pending') {
-      return
-    }
+    if (currentRole !== 'pending') return
+
+    const supabase = createClient()
 
     const channel = supabase
       .channel(`profile-changes-${userId}`)
@@ -30,19 +30,24 @@ export function ApprovalWatcher({ userId, currentRole }: ApprovalWatcherProps) {
           filter: `id=eq.${userId}`,
         },
         (payload) => {
-          const newRole = payload.new?.role
-          const oldRole = payload.old?.role
+          const newRole = (payload.new as any)?.role
+          const oldRole = (payload.old as any)?.role
+
+          if (redirectedRef.current) return
 
           if (oldRole === 'pending' && newRole && newRole !== 'pending') {
+            redirectedRef.current = true
+
             toast.success("Welcome! You've been approved 🎉", {
               description: 'Redirecting to lobby...',
               duration: 3000,
             })
 
+            // אין באמת צורך ב-timeout; אם את רוצה להשאיר UX—קצר יותר
             setTimeout(() => {
               router.push('/lobby')
               router.refresh()
-            }, 1000)
+            }, 300)
           }
         }
       )
@@ -51,7 +56,7 @@ export function ApprovalWatcher({ userId, currentRole }: ApprovalWatcherProps) {
     return () => {
       supabase.removeChannel(channel)
     }
-  }, [userId, currentRole, router, supabase])
+  }, [userId, currentRole, router])
 
   return null
 }
