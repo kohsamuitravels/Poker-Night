@@ -1,19 +1,12 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
-
-// Fisher–Yates shuffle עם random אמיתי (עדיף מ-sort עם UUID)
-function shuffle<T>(arr: T[]) {
-  const a = [...arr];
-  for (let i = a.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [a[i], a[j]] = [a[j], a[i]];
-  }
-  return a;
-}
+import { randomInt } from "crypto";
 
 function pickRolesClockwise(userIdsInOrder: string[]) {
   const n = userIdsInOrder.length;
-  const dealerIndex = Math.floor(Math.random() * n);
+
+  // crypto-safe random
+  const dealerIndex = randomInt(0, n);
   const sbIndex = (dealerIndex + 1) % n;
   const bbIndex = (dealerIndex + 2) % n;
 
@@ -64,29 +57,33 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Missing tableId" }, { status: 400 });
     }
 
-    // 4) אל תאפשר להתחיל משחק אם כבר יש סשן "running" לטבלה
-    const { data: existingRunning, error: existingErr } = await supabase
+    // 4) Check: already running? (NO maybeSingle - can handle multiple rows safely)
+    const { data: runningSessions, error: runningErr } = await supabase
       .from("table_sessions")
-      .select("id, status")
+      .select("id, started_at")
       .eq("table_id", tableId)
       .eq("status", "running")
-      .maybeSingle();
+      .order("started_at", { ascending: false });
 
-    if (existingErr) {
+    if (runningErr) {
       return NextResponse.json(
-        { error: "Session check failed", details: existingErr.message },
+        { error: "Session check failed", details: runningErr.message },
         { status: 500 }
       );
     }
 
-    if (existingRunning) {
+    if (runningSessions && runningSessions.length > 0) {
       return NextResponse.json(
-        { error: "Game already running", session_id: existingRunning.id },
+        {
+          error: "Game already running",
+          session_id: runningSessions[0].id,
+          running_count: runningSessions.length,
+        },
         { status: 409 }
       );
     }
 
-    // 5) Read members
+    // 5) Read members (joined only)
     const { data: members, error: membersErr } = await supabase
       .from("table_members")
       .select("user_id, seat, joined_at")
@@ -107,25 +104,23 @@ export async function POST(req: Request) {
       );
     }
 
-    // 6) סדר שחקנים: אם יש לפחות 4 עם seat מוגדר -> משתמשים ב-seat, אחרת joined_at
-    const withSeat = members.filter((m) => m.seat !== null && m.seat !== undefined);
-    const useSeats = withSeat.length >= 4;
+    // 6) Decide ordering: seat (if enough seats exist) else joined_at
+    const seatedCount = members.filter((m) => m.seat !== null && m.seat !== undefined).length;
+    const useSeats = seatedCount >= 4;
 
     const ordered = [...members].sort((a, b) => {
       if (useSeats) {
-        // seat null ילך לסוף
-        const aSeat = a.seat ?? 999999;
-        const bSeat = b.seat ?? 999999;
+        const aSeat = (a.seat ?? 999999) as number;
+        const bSeat = (b.seat ?? 999999) as number;
         return aSeat - bSeat;
       }
 
-      // joined_at יכול להיות null -> ילך לסוף
-      const aTime = a.joined_at ? new Date(a.joined_at).getTime() : Number.MAX_SAFE_INTEGER;
-      const bTime = b.joined_at ? new Date(b.joined_at).getTime() : Number.MAX_SAFE_INTEGER;
+      const aTime = a.joined_at ? new Date(a.joined_at as any).getTime() : Number.MAX_SAFE_INTEGER;
+      const bTime = b.joined_at ? new Date(b.joined_at as any).getTime() : Number.MAX_SAFE_INTEGER;
       return aTime - bTime;
     });
 
-    // 7) unique user_ids (למקרה של כפילויות)
+    // 7) Unique user ids (safety)
     const userIdsInOrder = Array.from(new Set(ordered.map((m) => m.user_id)));
 
     if (userIdsInOrder.length < 4) {
@@ -135,9 +130,7 @@ export async function POST(req: Request) {
       );
     }
 
-    // 8) אם תרצה שהבחירה תהיה "רנדומלית אבל הוגנת" לאורך זמן:
-    // אפשר להגריל דילר ע"י shuffle ואז לקחת [0,1,2] בתור dealer/sb/bb על סדר הישיבה
-    // כרגע: נגריל dealerIndex ואז SB/BB לפי כיוון השעון על הסדר הקיים
+    // 8) Pick dealer/sb/bb (random dealer once per game)
     const roles = pickRolesClockwise(userIdsInOrder);
 
     // 9) Create session
@@ -167,14 +160,11 @@ export async function POST(req: Request) {
         ok: true,
         session,
         order_used: useSeats ? "seat" : "joined_at",
-        players_order: userIdsInOrder, // עוזר לדיבוג
+        players_order: userIdsInOrder,
       },
       { status: 200 }
     );
   } catch (err: any) {
-    return NextResponse.json(
-      { error: err?.message ?? "Unknown error" },
-      { status: 500 }
-    );
+    return NextResponse.json({ error: err?.message ?? "Unknown error" }, { status: 500 });
   }
 }
