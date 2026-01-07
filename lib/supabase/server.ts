@@ -21,3 +21,6 @@ export function createSupabaseServerClient() {
     }
   );
 }
+
+// ✅ Backwards-compatible export (כדי שלא תשברי קוד קיים)
+export const createClient = createSupabaseServerClient;
